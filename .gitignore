@@ -10,3 +10,8 @@ __pycache__/
 
 # Timestamped CSV output from modbus_register_sweep.py
 sweep_log_*.csv
+
+# Local Pad workspace link and auto-installed Pad skill files, not meant to be committed
+.pad.toml
+.claude/
+.agents/
