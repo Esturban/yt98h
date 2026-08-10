@@ -53,6 +53,8 @@ practice only the first five need a decision per deployment.
 | `POLL_INTERVAL_SECONDS` | No | `5` | Collector interval |
 | `FORWARDER_RETRY_INTERVAL_SECONDS` | No | `15` | Forwarder interval, independent of the poll interval |
 | `FORWARDER_BATCH_SIZE` | No | `500` | Rows per HTTP write, bounds any single request |
+| `IR4_INGEST_URL` | No | the client's production endpoint | Second delivery target, the client's live ingest API |
+| `IR4_DEVICE_TOKEN` | No | unset | Leave unset to keep this poll InfluxDB only. Setting it enables the client-API path, see docs/architecture.md |
 
 ## Reading the logs
 
@@ -75,9 +77,10 @@ architecture doc.
 |---|---|
 | `yt98h_pipeline.py` | Container entrypoint. Runs both loops as threads. |
 | `yt98h_collector.py` | Polls every address, writes to the outbox. Imports the driver from `../yt98h_modbus.py`. |
-| `yt98h_forwarder.py` | Drains unsent rows to InfluxDB in batches. |
+| `yt98h_forwarder.py` | Drains unsent rows to InfluxDB in batches, and to the client API when `IR4_DEVICE_TOKEN` is set. |
 | `yt98h_outbox.py` | SQLite schema and queue operations. |
 | `yt98h_lineprotocol.py` | InfluxDB line protocol serialization. |
+| `yt98h_client_api.py` | Client-API payload building and HTTP POST. |
 | `test_yt98h_pipeline.py` | Tests. No hardware and no InfluxDB needed. |
 
 ## Running without Docker

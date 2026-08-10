@@ -113,6 +113,27 @@ carries identical field values, that non-determinism is harmless regardless
 of which write wins, but it is a real behavioral difference from OSS worth
 knowing about if the target ever changes.
 
+### Step 3b: Forward to the client's ingest API (best effort, independent)
+
+**Actor**: Forwarder
+**Action**: When `IR4_DEVICE_TOKEN` is set, the forwarder also pushes unsent
+rows to the client's live production ingest API, which already feeds the IR4
+PPE Compliance dashboard. This is a second, independent delivery target, not
+a replacement for the InfluxDB write: the SQLite outbox remains the
+durability layer regardless of which target(s) are configured, and InfluxDB
+keeps receiving every reading as a backup copy.
+**"Sent" semantics**: the outbox tracks delivery to each target independently,
+via `client_api_sent`, a column separate from `sent` (InfluxDB, see Local
+Outbox Schema below). A row already confirmed by InfluxDB can still be unsent
+to the client API, and vice versa; a failure or a growing backlog on one
+target never blocks or gates retry on the other. A single shared `sent` flag
+gating both was rejected: it would make whichever write happens to run first
+in a cycle silently gate the other's retry, and the client API now feeds the
+actual production safety dashboard, so it is at least as important to retry
+reliably as the InfluxDB copy, not subordinate to it.
+**Payload shape**: unconfirmed against a real successful request, see A6 in
+Assumptions and `edge/yt98h_client_api.py`.
+
 ## Local Outbox Schema (SQLite)
 
 One row per sensor reading, per poll cycle.
@@ -127,6 +148,7 @@ One row per sensor reading, per poll cycle.
 | `raw_register_value` | INTEGER | Raw r31, kept for traceability back to the source register |
 | `reading_timestamp_utc` | TEXT (ISO 8601) | Set at the moment of the read in Step 1, this is the value forwarded to InfluxDB as the point timestamp |
 | `sent` | INTEGER (0/1) | Default 0, set to 1 only after a confirmed InfluxDB write |
+| `client_api_sent` | INTEGER (0/1) | Default 0, set to 1 only after a confirmed write to the client's ingest API (see Step 3b). Independent of `sent`: neither column gates the other. |
 | `created_at_utc` | TEXT (ISO 8601) | When the row was written to SQLite, for local debugging only, never forwarded |
 
 The forwarder's query is simply "all rows where `sent = 0`, oldest first."
@@ -141,6 +163,7 @@ CREATE TABLE IF NOT EXISTS readings (
     raw_register_value    INTEGER NOT NULL,
     reading_timestamp_utc TEXT    NOT NULL,
     sent                  INTEGER NOT NULL DEFAULT 0,
+    client_api_sent       INTEGER NOT NULL DEFAULT 0,
     created_at_utc        TEXT    NOT NULL
 );
 
@@ -150,6 +173,11 @@ CREATE TABLE IF NOT EXISTS readings (
 -- Leading on `sent` serves the filter, trailing `id` serves the ordering, so
 -- the whole query is answered from the index.
 CREATE INDEX IF NOT EXISTS idx_readings_unsent ON readings (sent, id);
+
+-- Same shape, for the client-API delivery path's own "client_api_sent = 0,
+-- oldest first" query. Kept as a second index rather than a combined one
+-- because the two columns are queried and updated independently.
+CREATE INDEX IF NOT EXISTS idx_readings_client_api_unsent ON readings (client_api_sent, id);
 ```
 
 ## InfluxDB Schema (command-center)
@@ -218,6 +246,8 @@ different environment, nothing rebuilt, nothing changed in code.
 | `INFLUXDB_BUCKET` | Yes | Target bucket for `gas_reading` points. |
 | `FORWARDER_RETRY_INTERVAL_SECONDS` | No | How often the forwarder attempts to drain unsent rows. Independent of `POLL_INTERVAL_SECONDS`. Defaults to `15`. |
 | `FORWARDER_BATCH_SIZE` | No | Maximum rows pushed in a single HTTP write. Defaults to `500`. Bounds the size of any one request so that draining a large backlog does not turn into one enormous POST. |
+| `IR4_INGEST_URL` | No | Second delivery target, the client's live production ingest API. Defaults to the confirmed endpoint if unset. |
+| `IR4_DEVICE_TOKEN` | No | Per-device auth token for the client API, sent as `X-Device-Token`. Unset disables Step 3b entirely; behavior is then identical to before it existed. |
 
 `INFLUXDB_URL`/`INFLUXDB_TOKEN`/`INFLUXDB_ORG`/`INFLUXDB_BUCKET` are named as
 a single set deliberately: a second command center later means a second set
@@ -271,6 +301,7 @@ a dedicated pass before this goes to production.
 | A3 | InfluxDB at the command center runs OSS v2 (self-hosted, TSM engine), using the org/bucket/token HTTP write API described above. This schema and API shape have now been verified as an accurate description of the InfluxDB OSS v2 write API contract specifically, it is not an unverified guess. What remains an assumption is which InfluxDB product or deployment the command center actually runs. | If it's actually InfluxDB v1 or a materially different auth model, the forwarder's write calls and the env vars above need to change. If it's InfluxDB Cloud Serverless, Dedicated, or Clustered instead of OSS v2 (the newer IOx-based products), the write API shape is largely compatible, but the deterministic overwrite behavior this design relies on for retry idempotency (see Step 3) does not hold there, same-timestamp same-tag-set write ordering is not guaranteed deterministic on those products. |
 | A4 | Local disk on the Jetson has at least **1 GB free** for the outbox. That covers a **72 hour** outage more than twenty times over, at the sizing below. | A sufficiently long outage could fill the disk, causing the collector's SQLite writes to start failing, which is a real data loss path this spec does not currently cover. At 1 GB the disk is not the binding constraint on any outage anyone expects to actually happen. |
 | A5 | The Jetson's system clock is kept reasonably accurate (e.g. NTP, even if only synced during the brief windows the link is up). | Silent timestamp corruption on every reading during a drift window, not caught by any check in this pipeline. |
+| A6 | The client API's request body is a flat JSON object with keys `co2_ppm`, `co_ppm`, `h2s_ppm`, `lel_pct`, `o2_pct`, one object per full poll cycle. This is inferred from the existing third-party agent's own local debug log line, not from a successful request: a live probe confirmed the URL, the `X-Device-Token` header, and the error envelope shape, but no valid device token was available to see real body validation. | If the real body schema differs (nesting, different field names, a required `device_id`, etc.), every push to this target is silently rejected until `edge/yt98h_client_api.py`'s `build_payload()` is corrected against a real device token. The InfluxDB copy is unaffected either way, since the two targets are independent (see Step 3b). |
 
 ### Outbox sizing (basis for A4)
 
