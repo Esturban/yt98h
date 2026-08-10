@@ -14,11 +14,13 @@ setting `SITE_ID` and pointing at the command center, both in `.env`. Nothing
 is rebuilt per site, nothing tracked in this directory is edited per site.
 
 ```bash
-git clone <this repo> && cd yt98h/edge
+git clone https://github.com/Esturban/yt98h.git && cd yt98h/edge
 
 cp .env.example .env
 # Edit .env: SITE_ID (unique per poll, e.g. poll-02) and the four INFLUXDB_
-# values. That is the entire per-poll configuration surface.
+# values. That is the required per-poll configuration surface. IR4_DEVICE_TOKEN
+# is optional, set it to also push to the client's live ingest API, leave it
+# blank to keep this poll InfluxDB only.
 
 docker compose up -d
 docker logs -f yt98h-pipeline
@@ -37,7 +39,9 @@ Three things to check on a new box before assuming it works:
 ## Environment variables
 
 The full contract. Defaults are already set in `docker-compose.yml`, so in
-practice only the first five need a decision per deployment.
+practice only the first five need a decision per deployment, plus a sixth,
+`IR4_DEVICE_TOKEN`, if this poll should also push to the client's live
+ingest API.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
@@ -58,14 +62,19 @@ practice only the first five need a decision per deployment.
 
 ## Reading the logs
 
-stdout is the only visibility this pipeline has, by design. The forwarder's
-three numbers are the whole diagnostic surface:
+stdout is the only visibility this pipeline has, by design. The forwarder logs
+one `forward cycle: N pushed, N failed, N unsent in backlog` line per cycle
+for the InfluxDB path, and, when `IR4_DEVICE_TOKEN` is set, a second,
+independent `client-api forward cycle: N pushed, N failed, N unsent in
+backlog` line for the client API. The two numbers can differ, one target
+being healthy says nothing about the other, that is the point of tracking
+them separately (see the "sent" semantics note in docs/architecture.md).
 
 | Log line | Means |
 |---|---|
-| `0 pushed, N failed, backlog growing` | Link down, or the token is wrong. Rows are safe, they retry forever. |
-| `N pushed, 0 failed, 0 unsent` | Healthy. |
-| backlog never reaches 0 while pushing | The link cannot keep up with 1 row/s. |
+| `0 pushed, N failed, backlog growing` | That target's link is down, or its token is wrong. Rows are safe, they retry forever. |
+| `N pushed, 0 failed, 0 unsent` | That target is healthy. |
+| backlog never reaches 0 while pushing | That target's link cannot keep up with 1 row/s. |
 | `no response from [3]` | That channel is silent. Skipped, never written as a false zero. |
 
 A backlog costs about 13 MB/day of disk. See the sizing table in the
@@ -89,7 +98,7 @@ Each file runs standalone on a bench machine, PEP 723 style like the rest of
 the repo:
 
 ```bash
-uv run test_yt98h_pipeline.py     # 41 tests, no hardware needed
+uv run test_yt98h_pipeline.py     # 59 tests, no hardware needed
 uv run yt98h_pipeline.py          # both loops, needs the env vars above
 uv run yt98h_collector.py         # collector only
 ```
