@@ -1,21 +1,59 @@
 # YT-98H Gas Transmitter
 
 Reads 5 gas sensors over Modbus RTU (RS-485).
-Works on Windows, Linux and macOS.
+Works on Windows, Linux and macOS. Developed and bench-tested on macOS first.
+
+## Prerequisites
+
+The only thing you need installed is `uv`. It replaces pip, venv, and
+requirements.txt for this repo: every script declares its own dependencies
+inline (PEP 723), so `uv run` builds and caches a throwaway environment per
+script automatically. No `pip install`, no manual venv, nothing to activate.
+
+**macOS / Linux:**
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+macOS alternative if you use Homebrew: `brew install uv`
+
+**Windows (PowerShell):**
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Windows alternative if you use winget: `winget install --id=astral-sh.uv -e`
+
+Verify it worked (any OS):
+
+```bash
+uv --version
+```
 
 ## Start here
 
-```bash
-# Step 0
-chmod +x ./dev_path.sh
-chmod 666 [/dev/USB0 OR WHATEVER DEVICE IT IS] # use this to map the device (so it will change when connected directly)
+**Linux only**: grant permission to the USB serial device before the first
+run (the device node can change each time it's plugged in; `scripts/linux/dev_path.sh`
+finds the current one):
 
+```bash
+chmod +x ./scripts/linux/dev_path.sh
+./scripts/linux/dev_path.sh                # lists connected USB serial devices + IDs
+chmod 666 /dev/ttyUSB0                     # replace with the device it reports
+```
+
+macOS and Windows need no permission step, skip straight to below.
+
+```bash
 uv run yt98h_modbus.py detect     # find the device
 uv run yt98h_modbus.py map        # see every register and every gas value
 uv run yt98h_modbus.py watch      # live values, updates every second
 ```
 
-`uv run` installs everything by itself. No Python setup needed.
+`uv run` installs everything by itself. No Python setup needed beyond `uv`
+itself, above.
 
 To make the CSV file for the vendor, run this and press Ctrl+C after a few
 seconds:
@@ -147,7 +185,8 @@ If the script picks the wrong port, pass it on the command line instead:
 |---|---|
 | `yt98h_modbus.py` | Main tool. detect, map, watch. |
 | `modbus_register_sweep.py` | Makes the CSV for the vendor. |
-| `Get-ModbusDiagnostics-1.ps1` | Windows only. Checks your PC, not the sensor. |
+| `scripts/linux/dev_path.sh` | Linux only. Finds the current device node for a connected USB serial adapter. |
+| `scripts/windows/Get-ModbusDiagnostics-1.ps1` | Windows only. Checks your PC, not the sensor. |
 
 ## If it does not work
 
