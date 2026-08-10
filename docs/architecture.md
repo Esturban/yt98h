@@ -1,6 +1,9 @@
 # Architecture: Edge-to-Command-Center Data Pipeline
 
-**Status**: Draft, spec only. Nothing described here is implemented yet.
+**Status**: Implemented as an MVP in [`../edge/`](../edge/), which follows this
+document rather than diverging from it. The collector, the SQLite outbox, the
+forwarder and the container packaging all exist and are tested. What is still
+only described here is everything under Deferred and Open Questions.
 **Scope**: One "poll" (edge site). The same container image is redeployed
 unchanged to future polls by changing environment variables.
 

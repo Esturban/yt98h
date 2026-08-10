@@ -185,22 +185,31 @@ If the script picks the wrong port, pass it on the command line instead:
 |---|---|
 | `yt98h_modbus.py` | Main tool. detect, map, watch. One script, runs the same on every OS. |
 | `modbus_register_sweep.py` | Makes the CSV for the vendor. Also OS-agnostic. |
+| `edge/` | The edge pipeline: polls the device, queues readings locally, pushes them to a command-center InfluxDB. Containerized, one image per poll. See `edge/README.md`. |
 | `scripts/linux/dev_path.sh` | Linux only. Finds the current device node for a connected USB serial adapter. |
 | `scripts/windows/Get-ModbusDiagnostics-1.ps1` | Windows only. Checks your PC, not the sensor. |
 | `scripts/windows/ModScan/` | Windows only. Vendor's ModScan32 GUI Modbus poller, kept for cross-checking readings. Run `ModScan32.exe` directly, nothing to install. |
 | `docs/vendor/` | Vendor reference PDFs: the ModSan operation manual and the Safegas Modbus protocol spec. |
 
-Only `yt98h_modbus.py` and `modbus_register_sweep.py` are this repo's own
+`yt98h_modbus.py`, `modbus_register_sweep.py` and `edge/` are this repo's own
 code. Everything else under `scripts/` and `docs/vendor/` is a platform
 helper or vendor reference material kept alongside it.
 
-## Roadmap
+## The edge pipeline
 
-Not built yet, noted here so it isn't lost: this device-facing repo is meant
-to become one edge-facing piece of a larger pipeline, readings pushed from a
-nano/edge server into a time-series store (likely InfluxDB), containerized,
-and shipped over API to a central blade server. Architecture isn't decided.
-Treat anything above this line as the current, working scope.
+The tools above talk to the device from a laptop. `edge/` is the other half:
+the same readings, taken continuously on a Jetson at the poll, queued to a
+local SQLite outbox, and pushed to a command-center InfluxDB whenever the
+optical link is up. The outbox is the point of it, an outage of any length
+costs delay rather than data.
+
+MVP is built and tested. Design and rationale live in
+[`docs/architecture.md`](docs/architecture.md), deployment in
+[`edge/README.md`](edge/README.md).
+
+Still not built, noted so it isn't lost: fleet orchestration across the eight
+polls, and anything that tells an operator a backlog is stuck without someone
+reading `docker logs` by hand.
 
 ## If it does not work
 
