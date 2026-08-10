@@ -35,8 +35,15 @@ import threading
 import time
 from datetime import datetime, timezone
 
-import yt98h_modbus
-import yt98h_outbox as outbox
+# yt98h_modbus.py stays at the repo root, one directory up, where the bench
+# tooling lives and where the README documents it. This package reuses it rather
+# than vendoring a second copy that would drift. Inside the container both files
+# sit in /app together and this line is a harmless no-op.
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import yt98h_modbus  # noqa: E402  repo root, see the sys.path line above
+import yt98h_outbox as outbox  # noqa: E402
 
 LOG = logging.getLogger("collector")
 
