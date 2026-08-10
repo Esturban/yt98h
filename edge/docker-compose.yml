@@ -1,0 +1,85 @@
+# Edge pipeline deployment for one poll.
+#
+# Every variable in the Container Contract of docs/architecture.md is declared
+# here, so this file is the whole per-poll configuration surface. Redeploying to
+# a new poll means changing SITE_ID and the four INFLUXDB_ values, nothing else,
+# and rebuilding nothing.
+#
+#     docker compose up -d
+#     docker logs -f yt98h-pipeline
+#
+# The four INFLUXDB_ values are read from a local .env file, which is
+# gitignored. Everything else has a working default in place.
+
+# Pinned rather than derived from the directory name, so the volume holding the
+# outbox is called yt98h-edge_yt98h-outbox on all eight polls instead of
+# inheriting whatever the checkout directory happens to be named.
+name: yt98h-edge
+
+services:
+  yt98h-pipeline:
+    # Context is the repo root so the image can pick up yt98h_modbus.py, which
+    # the collector reuses rather than vendoring. Run compose from this
+    # directory and this resolves by itself.
+    build:
+      context: ..
+      dockerfile: edge/Dockerfile
+    image: yt98h-pipeline:latest
+    container_name: yt98h-pipeline
+
+    # A2 from the assumptions table: the pipeline comes back by itself after a
+    # Jetson reboot or a crash, with nobody on site to notice it went down.
+    # `unless-stopped` rather than `always` so a deliberate stop for maintenance
+    # stays stopped across a reboot.
+    restart: unless-stopped
+
+    # The USB RS-485 adapter. Must match SERIAL_PORT below. On a Jetson this is
+    # usually /dev/ttyUSB0, but the node can change across replug; if it does,
+    # change both this line and SERIAL_PORT together.
+    devices:
+      - "/dev/ttyUSB0:/dev/ttyUSB0"
+
+    # A1 from the assumptions table: the outbox must survive both a container
+    # restart and a Jetson reboot, because it is the only copy of any reading
+    # the link has not carried away yet. A named volume is the default here; a
+    # host bind mount can be swapped in later without touching anything else.
+    volumes:
+      - yt98h-outbox:/data
+
+    environment:
+      # Unique per poll across the fleet. Written into every SQLite row and
+      # every InfluxDB tag, and the only thing distinguishing this poll's data
+      # once several polls share one bucket.
+      SITE_ID: "poll-01"
+
+      # Modbus. Defaults match the bench verified hardware profile.
+      SERIAL_PORT: "/dev/ttyUSB0"
+      MODBUS_BAUD: "9600"
+      MODBUS_ADDRESSES: "1,2,3,4,5"
+
+      # Fast end of the accepted 5 to 10 second range, and the rate the disk
+      # budget in A4 is sized against.
+      POLL_INTERVAL_SECONDS: "5"
+
+      # Inside the named volume above.
+      SQLITE_DB_PATH: "/data/outbox.sqlite3"
+
+      # Command center. Set these four in .env, next to this file.
+      INFLUXDB_URL: "${INFLUXDB_URL}"
+      INFLUXDB_TOKEN: "${INFLUXDB_TOKEN}"
+      INFLUXDB_ORG: "${INFLUXDB_ORG}"
+      INFLUXDB_BUCKET: "${INFLUXDB_BUCKET}"
+
+      # Independent of POLL_INTERVAL_SECONDS. Three collector cycles per
+      # forwarder cycle keeps the write rate to the command center modest while
+      # the link is up, without letting the backlog build for any real length of
+      # time.
+      FORWARDER_RETRY_INTERVAL_SECONDS: "15"
+
+      # Rows per HTTP write. Bounds any single request so that draining a
+      # multi-day backlog never becomes one enormous POST over a link that has
+      # only just come back.
+      FORWARDER_BATCH_SIZE: "500"
+
+volumes:
+  yt98h-outbox:
