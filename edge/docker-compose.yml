@@ -2,14 +2,15 @@
 #
 # Every variable in the Container Contract of docs/architecture.md is declared
 # here, so this file is the whole per-poll configuration surface. Redeploying to
-# a new poll means changing SITE_ID and the four INFLUXDB_ values, nothing else,
-# and rebuilding nothing.
+# a new poll means setting SITE_ID and the four INFLUXDB_ values in .env,
+# nothing else, and rebuilding nothing. Nothing in this tracked file is edited
+# per site, see .env.example.
 #
 #     docker compose up -d
 #     docker logs -f yt98h-pipeline
 #
-# The four INFLUXDB_ values are read from a local .env file, which is
-# gitignored. Everything else has a working default in place.
+# SITE_ID and the four INFLUXDB_ values are read from a local .env file, which
+# is gitignored. Everything else has a working default in place.
 
 # Pinned rather than derived from the directory name, so the volume holding the
 # outbox is called yt98h-edge_yt98h-outbox on all eight polls instead of
@@ -49,8 +50,8 @@ services:
     environment:
       # Unique per poll across the fleet. Written into every SQLite row and
       # every InfluxDB tag, and the only thing distinguishing this poll's data
-      # once several polls share one bucket.
-      SITE_ID: "poll-01"
+      # once several polls share one bucket. Set in .env, next to this file.
+      SITE_ID: "${SITE_ID}"
 
       # Modbus. Defaults match the bench verified hardware profile.
       SERIAL_PORT: "/dev/ttyUSB0"

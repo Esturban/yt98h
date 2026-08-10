@@ -10,21 +10,15 @@ Design and rationale: [`../docs/architecture.md`](../docs/architecture.md).
 ## Deploying a new poll
 
 The same image runs on every poll. Rolling out poll 2 through poll 8 means
-changing `SITE_ID` and pointing at the command center. Nothing is rebuilt per
-site, nothing in this directory is edited per site.
+setting `SITE_ID` and pointing at the command center, both in `.env`. Nothing
+is rebuilt per site, nothing tracked in this directory is edited per site.
 
 ```bash
 git clone <this repo> && cd yt98h/edge
 
-cat > .env <<'ENV'
-INFLUXDB_URL=http://command-center:8086
-INFLUXDB_TOKEN=<write-scoped token>
-INFLUXDB_ORG=<org>
-INFLUXDB_BUCKET=<bucket>
-ENV
-
-# The one line that differs per poll. Must be unique across the fleet.
-sed -i 's/poll-01/poll-02/' docker-compose.yml
+cp .env.example .env
+# Edit .env: SITE_ID (unique per poll, e.g. poll-02) and the four INFLUXDB_
+# values. That is the entire per-poll configuration surface.
 
 docker compose up -d
 docker logs -f yt98h-pipeline
@@ -47,7 +41,7 @@ practice only the first five need a decision per deployment.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `SITE_ID` | Yes | `poll-01` | Identifies this poll. Must be unique across the fleet. Tagged onto every point. |
+| `SITE_ID` | Yes | from `.env` | Identifies this poll. Must be unique across the fleet. Tagged onto every point. |
 | `INFLUXDB_URL` | Yes | from `.env` | Command-center write endpoint |
 | `INFLUXDB_TOKEN` | Yes | from `.env` | Write-scoped token |
 | `INFLUXDB_ORG` | Yes | from `.env` | InfluxDB organization |
