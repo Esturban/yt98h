@@ -1,2 +1,12 @@
 .env
 .DS_Store
+
+# Python bytecode/cache (PEP 723 scripts run via `uv run`, no project venv normally needed)
+__pycache__/
+*.py[cod]
+
+# Manual venv, if ever created for local debugging
+.venv/
+
+# Timestamped CSV output from modbus_register_sweep.py
+sweep_log_*.csv
