@@ -26,6 +26,9 @@ Covered:
                    timestamp precision and exactness
     retry          a row that fails to mark stays queryable, a row that
                    succeeds is never handed out again
+    client API     payload field mapping, cycle grouping, the HTTP boundary
+                   (mocked, never a real request), and the forwarder's
+                   dual-write gating: client_api_sent is independent of sent
 """
 
 import os
@@ -36,6 +39,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import yt98h_client_api as client_api
+import yt98h_forwarder as forwarder
 import yt98h_lineprotocol as lp
 import yt98h_outbox as outbox
 
@@ -255,6 +260,49 @@ def test_mark_sent_twice_is_a_no_op(conn):
 
 
 # --------------------------------------------------------------------------
+# Outbox: the client-API delivery path is independent of the InfluxDB one
+# --------------------------------------------------------------------------
+
+def test_fetch_unsent_client_api_ignores_the_influxdb_sent_flag(conn):
+    outbox.insert_readings(conn, [reading(address=a) for a in (1, 2)])
+    outbox.mark_sent(conn, [r["id"] for r in outbox.fetch_unsent(conn, limit=10)])
+
+    # Confirmed by InfluxDB, but the client-API path has not touched it yet.
+    assert len(outbox.fetch_unsent_client_api(conn, limit=10)) == 2
+    assert outbox.count_unsent(conn) == 0
+
+
+def test_mark_client_api_sent_does_not_touch_sent(conn):
+    outbox.insert_readings(conn, [reading()])
+    row_id = outbox.fetch_unsent_client_api(conn, limit=1)[0]["id"]
+
+    outbox.mark_client_api_sent(conn, [row_id])
+
+    assert outbox.count_unsent_client_api(conn) == 0
+    assert outbox.count_unsent(conn) == 1
+
+
+def test_connect_migrates_an_outbox_from_before_client_api_sent_existed(db_path):
+    # An outbox file written by a prior version of this pipeline, before this
+    # column existed. Opening it again must add the column in place, not error.
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(outbox.SCHEMA_SQL)
+    legacy.execute(
+        "INSERT INTO readings (site_id, sensor_address, gas_type, value, "
+        "raw_register_value, reading_timestamp_utc, created_at_utc) "
+        "VALUES ('poll-01', 1, 'H2S', 0.0, 0, '2026-08-10T12:00:00+00:00', "
+        "'2026-08-10T12:00:00+00:00')")
+    legacy.commit()
+    legacy.close()
+
+    migrated = outbox.connect(db_path)
+    try:
+        assert outbox.count_unsent_client_api(migrated) == 1
+    finally:
+        migrated.close()
+
+
+# --------------------------------------------------------------------------
 # Line protocol: timestamps
 # --------------------------------------------------------------------------
 
@@ -410,6 +458,193 @@ def test_encode_batch_accepts_sqlite_rows(conn):
 
     assert lp.encode_batch(rows) == lp.encode_point(
         reading(address=3, gas="O2", value=20.9, raw=209))
+
+
+# --------------------------------------------------------------------------
+# Client API: payload building
+# --------------------------------------------------------------------------
+
+def test_build_payload_maps_gas_type_to_field():
+    rows = [
+        reading(gas="H2S", value=0.0),
+        reading(gas="CO", value=1.2),
+        reading(gas="O2", value=20.9),
+        reading(gas="LEL", value=0.0),
+        reading(gas="CO2", value=834.0),
+    ]
+    assert client_api.build_payload(rows) == {
+        "h2s_ppm": 0.0,
+        "co_ppm": 1.2,
+        "o2_pct": 20.9,
+        "lel_pct": 0.0,
+        "co2_ppm": 834.0,
+    }
+
+
+def test_build_payload_omits_a_silent_channel_rather_than_a_zero():
+    # Channel 3 (O2) did not answer this cycle, per the collector's "skip,
+    # don't fabricate a zero" convention, so no row for it ever reaches the
+    # outbox. The payload must not invent an o2_pct key either.
+    rows = [reading(gas="H2S"), reading(gas="CO")]
+    payload = client_api.build_payload(rows)
+    assert set(payload) == {"h2s_ppm", "co_ppm"}
+
+
+def test_build_payload_skips_an_unmapped_gas_code():
+    assert client_api.build_payload([reading(gas="code7")]) == {}
+
+
+def test_build_payload_of_nothing_is_empty():
+    assert client_api.build_payload([]) == {}
+
+
+# --------------------------------------------------------------------------
+# Client API: grouping by poll cycle
+# --------------------------------------------------------------------------
+
+def test_group_by_cycle_groups_rows_sharing_created_at():
+    same_cycle = [reading(address=1, stamp="2026-08-10T12:00:00.000000+00:00"),
+                  reading(address=2, stamp="2026-08-10T12:00:00.000000+00:00")]
+    next_cycle = [reading(address=3, stamp="2026-08-10T12:00:05.000000+00:00")]
+
+    groups = client_api.group_by_cycle(same_cycle + next_cycle)
+
+    assert [len(g) for g in groups] == [2, 1]
+
+
+def test_group_by_cycle_of_nothing_is_empty():
+    assert client_api.group_by_cycle([]) == []
+
+
+# --------------------------------------------------------------------------
+# Client API: the HTTP boundary (mocked, never a real request)
+# --------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def test_post_readings_returns_on_2xx(monkeypatch):
+    monkeypatch.setattr(client_api.urllib.request, "urlopen",
+                        lambda request, timeout: _FakeResponse(202))
+    client_api.post_readings("https://example.invalid/ingest", "tok", {"h2s_ppm": 0.0})
+
+
+def test_post_readings_raises_on_non_2xx(monkeypatch):
+    monkeypatch.setattr(client_api.urllib.request, "urlopen",
+                        lambda request, timeout: _FakeResponse(401))
+    with pytest.raises(RuntimeError):
+        client_api.post_readings("https://example.invalid/ingest", "tok", {})
+
+
+def test_post_readings_sends_the_device_token_header(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        # Request.add_header() stores the key via str.capitalize(), which
+        # lowercases everything after the first letter, so the stored key is
+        # "X-device-token" even though post_readings() adds "X-Device-Token".
+        captured["token"] = request.get_header("X-device-token")
+        return _FakeResponse(202)
+
+    monkeypatch.setattr(client_api.urllib.request, "urlopen", fake_urlopen)
+    client_api.post_readings("https://example.invalid/ingest", "secret-tok", {})
+
+    assert captured["token"] == "secret-tok"
+
+
+# --------------------------------------------------------------------------
+# Forwarder: dual-write gating
+# --------------------------------------------------------------------------
+
+def _set_required_forwarder_env(monkeypatch):
+    monkeypatch.setenv("SQLITE_DB_PATH", "/tmp/yt98h-test-outbox.sqlite3")
+    monkeypatch.setenv("INFLUXDB_URL", "http://command-center:8086")
+    monkeypatch.setenv("INFLUXDB_TOKEN", "tok")
+    monkeypatch.setenv("INFLUXDB_ORG", "org")
+    monkeypatch.setenv("INFLUXDB_BUCKET", "bucket")
+
+
+def test_config_from_env_client_api_disabled_when_token_unset(monkeypatch):
+    _set_required_forwarder_env(monkeypatch)
+    monkeypatch.delenv("IR4_DEVICE_TOKEN", raising=False)
+
+    assert forwarder.config_from_env()["client_api_token"] is None
+
+
+def test_config_from_env_client_api_enabled_when_token_set(monkeypatch):
+    _set_required_forwarder_env(monkeypatch)
+    monkeypatch.setenv("IR4_DEVICE_TOKEN", "device-tok")
+    monkeypatch.delenv("IR4_INGEST_URL", raising=False)
+
+    config = forwarder.config_from_env()
+    assert config["client_api_token"] == "device-tok"
+    assert config["client_api_url"] == client_api.DEFAULT_INGEST_URL
+
+
+def test_config_from_env_client_api_url_is_overridable(monkeypatch):
+    _set_required_forwarder_env(monkeypatch)
+    monkeypatch.setenv("IR4_DEVICE_TOKEN", "device-tok")
+    monkeypatch.setenv("IR4_INGEST_URL", "https://staging.example.invalid/ingest")
+
+    assert (forwarder.config_from_env()["client_api_url"]
+            == "https://staging.example.invalid/ingest")
+
+
+def test_drain_client_api_pushes_and_marks_only_that_column(conn, monkeypatch):
+    outbox.insert_readings(conn, [reading(address=1, gas="H2S"),
+                                  reading(address=2, gas="CO")])
+    monkeypatch.setattr(forwarder.client_api, "post_readings",
+                        lambda url, token, payload: None)
+
+    pushed, failed = forwarder.drain_client_api(conn, "https://x.invalid", "tok", 500)
+
+    assert (pushed, failed) == (2, 0)
+    assert outbox.count_unsent_client_api(conn) == 0
+    assert outbox.count_unsent(conn) == 2  # InfluxDB path untouched by this call
+
+
+def test_drain_client_api_failure_leaves_rows_unsent(conn, monkeypatch):
+    outbox.insert_readings(conn, [reading(address=1, gas="H2S")])
+
+    def failing_post(url, token, payload):
+        raise RuntimeError("client API returned 401")
+
+    monkeypatch.setattr(forwarder.client_api, "post_readings", failing_post)
+
+    pushed, failed = forwarder.drain_client_api(conn, "https://x.invalid", "tok", 500)
+
+    assert (pushed, failed) == (0, 1)
+    assert outbox.count_unsent_client_api(conn) == 1
+
+
+def test_drain_client_api_groups_by_cycle_before_posting(conn, monkeypatch):
+    # Two channels from one poll cycle, one channel from the next: this must
+    # be two POSTs, one flattened object per cycle, not three and not one.
+    same_stamp = "2026-08-10T12:00:00.000000+00:00"
+    other_stamp = "2026-08-10T12:00:05.000000+00:00"
+    outbox.insert_readings(conn, [reading(address=1, gas="H2S", stamp=same_stamp),
+                                  reading(address=2, gas="CO", stamp=same_stamp)])
+    outbox.insert_readings(conn, [reading(address=3, gas="O2", stamp=other_stamp)])
+
+    posted = []
+    monkeypatch.setattr(
+        forwarder.client_api, "post_readings",
+        lambda url, token, payload: posted.append(payload))
+
+    pushed, failed = forwarder.drain_client_api(conn, "https://x.invalid", "tok", 500)
+
+    assert (pushed, failed) == (3, 0)
+    assert len(posted) == 2
+    assert posted[0] == {"h2s_ppm": 0.0, "co_ppm": 0.0}
+    assert posted[1] == {"o2_pct": 0.0}
 
 
 if __name__ == "__main__":
