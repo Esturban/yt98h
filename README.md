@@ -183,10 +183,24 @@ If the script picks the wrong port, pass it on the command line instead:
 
 | File | What it does |
 |---|---|
-| `yt98h_modbus.py` | Main tool. detect, map, watch. |
-| `modbus_register_sweep.py` | Makes the CSV for the vendor. |
+| `yt98h_modbus.py` | Main tool. detect, map, watch. One script, runs the same on every OS. |
+| `modbus_register_sweep.py` | Makes the CSV for the vendor. Also OS-agnostic. |
 | `scripts/linux/dev_path.sh` | Linux only. Finds the current device node for a connected USB serial adapter. |
 | `scripts/windows/Get-ModbusDiagnostics-1.ps1` | Windows only. Checks your PC, not the sensor. |
+| `scripts/windows/ModScan/` | Windows only. Vendor's ModScan32 GUI Modbus poller, kept for cross-checking readings. Run `ModScan32.exe` directly, nothing to install. |
+| `docs/vendor/` | Vendor reference PDFs: the ModSan operation manual and the Safegas Modbus protocol spec. |
+
+Only `yt98h_modbus.py` and `modbus_register_sweep.py` are this repo's own
+code. Everything else under `scripts/` and `docs/vendor/` is a platform
+helper or vendor reference material kept alongside it.
+
+## Roadmap
+
+Not built yet, noted here so it isn't lost: this device-facing repo is meant
+to become one edge-facing piece of a larger pipeline, readings pushed from a
+nano/edge server into a time-series store (likely InfluxDB), containerized,
+and shipped over API to a central blade server. Architecture isn't decided.
+Treat anything above this line as the current, working scope.
 
 ## If it does not work
 
