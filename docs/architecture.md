@@ -78,6 +78,16 @@ cause data loss, only delay.
 **Action**: On its own loop, independent of the collector's poll interval,
 query SQLite for unsent rows and attempt an HTTP write to the
 command-center InfluxDB write API.
+**Batching**: the query is capped at `FORWARDER_BATCH_SIZE` rows (default 500),
+and the forwarder keeps issuing back to back batches within a single cycle for
+as long as batches keep succeeding, stopping when the backlog is empty or the
+first batch fails. After a multi-day outage there may be hundreds of thousands
+of unsent rows; pushing them as one HTTP request would mean a single multi-
+megabyte POST that has to succeed or fail in its entirety over exactly the kind
+of marginal link that caused the backlog. Line protocol imposes no hard row
+limit per request, so this is a practical bound, not a protocol one: a few
+hundred points per write keeps each request small enough to complete over a
+weak link, and makes a failure cost one batch of progress rather than all of it.
 **On success**: mark the pushed rows as sent in SQLite.
 **On failure, of any kind**: do nothing to the rows, they remain unsent, and
 retry on the next forwarder cycle. The forwarder treats "is the link up
@@ -117,6 +127,27 @@ One row per sensor reading, per poll cycle.
 | `created_at_utc` | TEXT (ISO 8601) | When the row was written to SQLite, for local debugging only, never forwarded |
 
 The forwarder's query is simply "all rows where `sent = 0`, oldest first."
+
+```sql
+CREATE TABLE IF NOT EXISTS readings (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id               TEXT    NOT NULL,
+    sensor_address        INTEGER NOT NULL,
+    gas_type              TEXT    NOT NULL,
+    value                 REAL    NOT NULL,
+    raw_register_value    INTEGER NOT NULL,
+    reading_timestamp_utc TEXT    NOT NULL,
+    sent                  INTEGER NOT NULL DEFAULT 0,
+    created_at_utc        TEXT    NOT NULL
+);
+
+-- The forwarder's only query is "sent = 0, oldest first", and it runs every
+-- cycle for the life of the device. This index keeps it from degrading into a
+-- full table scan once a long outage has left tens of thousands of rows behind.
+-- Leading on `sent` serves the filter, trailing `id` serves the ordering, so
+-- the whole query is answered from the index.
+CREATE INDEX IF NOT EXISTS idx_readings_unsent ON readings (sent, id);
+```
 
 ## InfluxDB Schema (command-center)
 
@@ -158,7 +189,7 @@ the time it was actually measured, not the time it happened to be pushed.
 | Failure | What happens | Recovery |
 |---|---|---|
 | Jetson reboot or power loss mid-write | SQLite commits are atomic; a reading is either fully in the outbox or not written at all. Anything the collector had not yet committed is simply lost as if the poll cycle never ran (accepted: the next 5-10s poll produces a fresh reading). Nothing already in SQLite is affected. | Collector and forwarder restart with the container (see restart policy in the container contract). Forwarder resumes from wherever `sent = 0` rows exist, no special recovery logic needed. |
-| Network down for an extended period | Forwarder's writes fail every cycle. Rows accumulate in SQLite with `sent = 0`. Collector is unaffected and keeps writing. | No action needed. Forwarder keeps retrying every cycle. When the optical link returns, backlog drains as fast as InfluxDB accepts writes. Disk space for SQLite growth during a long outage is a capacity assumption, see Assumptions. |
+| Network down for an extended period | Forwarder's writes fail every cycle. Rows accumulate in SQLite with `sent = 0`. Collector is unaffected and keeps writing. | No action needed. Forwarder keeps retrying every cycle. When the optical link returns, the backlog drains in batches of `FORWARDER_BATCH_SIZE` rows per HTTP write, oldest first, not in one request. The forwarder keeps issuing batches within a cycle while they succeed, so a returning link drains as fast as InfluxDB accepts writes without ever building a single oversized POST. Disk space for SQLite growth during a long outage is a capacity assumption, see Assumptions. |
 | InfluxDB write API rejects a batch (e.g. malformed point, auth failure, server error) | Rejected rows are not marked sent. | Retried on the next forwarder cycle exactly like a network failure. A rejection that is permanent (e.g. bad credentials) will retry forever and never succeed; this pipeline does not distinguish retryable from permanent failures. Operator visibility into a stuck backlog is not designed here (see Assumptions/Open Questions). |
 | Partial batch failure (some points in a push accepted, some rejected) | Only rows confirmed accepted are marked sent. Any row not confirmed stays `sent = 0` and is retried. | Same retry path as a full failure. A retried row that was actually already accepted overwrites the same point (same measurement, tag set, and timestamp) with identical field values in InfluxDB, a no-op, not a duplicate record (accepted tradeoff, see overwrite semantics note in Step 3). |
 | Two distinct sensor readings for the same `site_id` + `sensor_address` + `gas_type` land on the exact same `reading_timestamp_utc` value | Because InfluxDB identifies a point by measurement, tag set, and timestamp together, the second write silently overwrites the first. This is real data loss, not a retry artifact, and InfluxDB returns no error. | Not recoverable after the fact. Prevented structurally, not by luck: the collector must capture `reading_timestamp_utc` at a precision fine enough that two distinct poll cycles for the same channel, 5 to 10 seconds apart, cannot land on the same value. Nanosecond precision (matching InfluxDB's native timestamp resolution) is recommended, millisecond is the practical minimum. This must be an explicit property of the collector's implementation, not an assumption that "5 to 10 seconds apart" is inherently safe. |
@@ -182,7 +213,8 @@ different environment, nothing rebuilt, nothing changed in code.
 | `INFLUXDB_TOKEN` | Yes | Write-scoped auth token for the InfluxDB write API. |
 | `INFLUXDB_ORG` | Yes | InfluxDB organization the bucket lives in (v2-style write API, see Assumptions). |
 | `INFLUXDB_BUCKET` | Yes | Target bucket for `gas_reading` points. |
-| `FORWARDER_RETRY_INTERVAL_SECONDS` | No | How often the forwarder attempts to drain unsent rows. Independent of `POLL_INTERVAL_SECONDS`. |
+| `FORWARDER_RETRY_INTERVAL_SECONDS` | No | How often the forwarder attempts to drain unsent rows. Independent of `POLL_INTERVAL_SECONDS`. Defaults to `15`. |
+| `FORWARDER_BATCH_SIZE` | No | Maximum rows pushed in a single HTTP write. Defaults to `500`. Bounds the size of any one request so that draining a large backlog does not turn into one enormous POST. |
 
 `INFLUXDB_URL`/`INFLUXDB_TOKEN`/`INFLUXDB_ORG`/`INFLUXDB_BUCKET` are named as
 a single set deliberately: a second command center later means a second set
@@ -203,6 +235,22 @@ error from InfluxDB. The forwarder should either always convert to
 nanoseconds (matching the default) or always pass an explicit, consistent
 `precision` value, either is acceptable, leaving it implicit is not.
 
+### Logging
+
+There is no dashboard on the Jetson and none is planned, so stdout is the only
+visibility this pipeline has, and it is therefore not optional. Both loops log
+one line per cycle to stdout, which Docker captures and `docker logs` replays:
+the collector logs each poll cycle's outcome, either success with the number of
+readings written, or failure with the error; the forwarder logs each cycle's
+outcome, rows pushed, rows failed, and the current unsent backlog size. Those
+three forwarder numbers are what make the two failure modes that are otherwise
+completely silent, a permanently rejected write (bad credentials) and a backlog
+that is growing faster than it drains, diagnosable by hand from `docker logs`
+alone. Logs go to stdout only, never to a file: writing logs to the same disk
+that holds the outbox would put log growth in competition with the backlog for
+the capacity budgeted in A4. Nothing else is designed here, no log levels, no
+rotation, no structured format.
+
 ## Deferred
 
 Security hardening of this pipeline itself, auth on the InfluxDB write
@@ -218,13 +266,46 @@ a dedicated pass before this goes to production.
 | A1 | `SQLITE_DB_PATH` is mounted on storage that survives a Jetson reboot (not container-ephemeral, not tmpfs). | A reboot during a network outage would silently drop the entire unsent backlog, violating the zero data loss requirement. |
 | A2 | The container's restart policy brings the collector and forwarder back up automatically after a Jetson reboot or crash, with no manual intervention. | A reboot could leave both processes down indefinitely with no one aware. |
 | A3 | InfluxDB at the command center runs OSS v2 (self-hosted, TSM engine), using the org/bucket/token HTTP write API described above. This schema and API shape have now been verified as an accurate description of the InfluxDB OSS v2 write API contract specifically, it is not an unverified guess. What remains an assumption is which InfluxDB product or deployment the command center actually runs. | If it's actually InfluxDB v1 or a materially different auth model, the forwarder's write calls and the env vars above need to change. If it's InfluxDB Cloud Serverless, Dedicated, or Clustered instead of OSS v2 (the newer IOx-based products), the write API shape is largely compatible, but the deterministic overwrite behavior this design relies on for retry idempotency (see Step 3) does not hold there, same-timestamp same-tag-set write ordering is not guaranteed deterministic on those products. |
-| A4 | Local disk on the Jetson has enough capacity to hold the full unsent backlog for the longest realistic optical-link outage. | A sufficiently long outage could fill the disk, causing the collector's SQLite writes to start failing, which is a real data loss path this spec does not currently cover. |
+| A4 | Local disk on the Jetson has at least **1 GB free** for the outbox. That covers a **72 hour** outage more than twenty times over, at the sizing below. | A sufficiently long outage could fill the disk, causing the collector's SQLite writes to start failing, which is a real data loss path this spec does not currently cover. At 1 GB the disk is not the binding constraint on any outage anyone expects to actually happen. |
 | A5 | The Jetson's system clock is kept reasonably accurate (e.g. NTP, even if only synced during the brief windows the link is up). | Silent timestamp corruption on every reading during a drift window, not caught by any check in this pipeline. |
+
+### Outbox sizing (basis for A4)
+
+This is a sizing estimate, not a guarantee. It is deliberately pessimistic at
+every step, and the conclusion is that disk is not a real constraint here.
+
+| Input | Value | Basis |
+|---|---|---|
+| Rows per poll cycle | 5 | One per sensor address, the five channels |
+| Poll interval, worst case | 5 s | Fast end of the accepted 5 to 10 s range |
+| Sustained row rate | ~1 row/s | 5 rows / 5 s, the worst case of the two |
+| Bytes per row | ~150 B | Conservative. Two ISO 8601 timestamp strings at 32 chars each dominate; the rest is short text and small ints plus a float. Includes SQLite record and b-tree overhead and the `(sent, id)` index entry. |
+
+From those: **86,400 rows/day**, about **13 MB/day** of outbox growth while the
+link is down. Nothing is ever deleted by this pipeline, so this is growth, not
+steady state.
+
+**Stated worst-case outage: 72 hours.** The reasoning is that the optical link
+is unscheduled, unmanaged, and generates no alert when it drops, so the recovery
+time is bounded not by the fault but by how long until a person is next at the
+site or happens to notice the data stopped. A long weekend is the realistic
+outer edge of that, and it is the number to size against. A 72 hour backlog is
+**259,200 rows, about 39 MB**.
+
+That is small enough that the honest conclusion is to stop optimizing: even a
+full **30 day** outage is only about **389 MB**, and the 1 GB free space
+assumed in A4 covers roughly **11 weeks** of continuous downtime. The disk fills
+long after every other part of this arrangement has failed for other reasons.
 
 ## Open Questions
 
 - How is a stuck backlog (e.g. permanently rejected writes due to bad
-  credentials) surfaced to an operator? Not designed here, no local
-  dashboard exists on the Jetson by design.
-- What is the disk capacity budget for the SQLite outbox, and what happens
-  if it is exceeded during an outage longer than planned for?
+  credentials) surfaced to an operator? Partially answered: the forwarder logs
+  rows pushed, rows failed, and backlog size every cycle to stdout (see
+  Logging), which makes it diagnosable by hand via `docker logs`. What is still
+  not designed is anything that pushes that fact to an operator who is not
+  already looking, no local dashboard exists on the Jetson by design.
+- ~~What is the disk capacity budget for the SQLite outbox?~~ Answered above,
+  see Outbox sizing. What remains open is what should happen if it is somehow
+  exceeded anyway: today the collector's writes would simply start failing, and
+  nothing in this pipeline detects or degrades gracefully in that case.
