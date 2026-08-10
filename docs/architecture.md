@@ -84,11 +84,21 @@ retry on the next forwarder cycle. The forwarder treats "is the link up
 right now" as opaque and unmanaged, it does not probe, does not alert on
 down time, and does not change behavior based on how long the link has been
 down.
-**Idempotency**: because failure leaves rows untouched and success is the
-only thing that advances state, a row is never marked sent until InfluxDB
-has actually accepted it, so a crash between "write succeeded" and "mark
-sent" at worst causes a harmless duplicate write on the next cycle, never a
-lost one.
+**Overwrite semantics on retry**: because failure leaves rows untouched and
+success is the only thing that advances state, a row is never marked sent
+until InfluxDB has actually accepted it. InfluxDB identifies a point by its
+measurement, tag set, and timestamp together, not by a separate row ID, so a
+crash between "write succeeded" and "mark sent" does not create a duplicate
+record on the next cycle. It overwrites the same point with identical field
+values, a no-op. On InfluxDB OSS v2 (the target here, see A3), this overwrite
+is deterministic: the existing and new field sets are unioned, with the new
+write's fields winning on any conflict. If InfluxDB Cloud Serverless,
+Dedicated, or Clustered is ever substituted for OSS v2 later, note that
+same-timestamp same-tag-set write ordering is not guaranteed deterministic
+there, a prior write may win instead. Since every retry in this pipeline
+carries identical field values, that non-determinism is harmless regardless
+of which write wins, but it is a real behavioral difference from OSS worth
+knowing about if the target ever changes.
 
 ## Local Outbox Schema (SQLite)
 
@@ -121,12 +131,22 @@ share one database):
 | `sensor_address` | `3` |
 | `gas_type` | `O2` |
 
+Line protocol tag values are always unquoted strings, there is no separate
+integer tag type. `sensor_address` is stored as `INTEGER` in the SQLite
+outbox (see Local Outbox Schema above) but must be serialized as a string
+tag here, e.g. `sensor_address=3`, not a numeric type.
+
 **Fields**:
 
 | Field | Type | Notes |
 |---|---|---|
 | `value` | float | Decoded reading in the sensor's native unit |
 | `raw_register_value` | integer | Raw r31, kept for traceability |
+
+Line protocol requires an explicit `i` suffix on integer field values, e.g.
+`raw_register_value=42i`. A bare number like `42` is parsed as a float. The
+forwarder must append this suffix when serializing `raw_register_value`, or
+it silently writes as a float and violates this schema.
 
 **Timestamp**: the actual reading time (`reading_timestamp_utc` from the
 outbox row), not the time of ingest. This is deliberate: after an extended
@@ -140,7 +160,8 @@ the time it was actually measured, not the time it happened to be pushed.
 | Jetson reboot or power loss mid-write | SQLite commits are atomic; a reading is either fully in the outbox or not written at all. Anything the collector had not yet committed is simply lost as if the poll cycle never ran (accepted: the next 5-10s poll produces a fresh reading). Nothing already in SQLite is affected. | Collector and forwarder restart with the container (see restart policy in the container contract). Forwarder resumes from wherever `sent = 0` rows exist, no special recovery logic needed. |
 | Network down for an extended period | Forwarder's writes fail every cycle. Rows accumulate in SQLite with `sent = 0`. Collector is unaffected and keeps writing. | No action needed. Forwarder keeps retrying every cycle. When the optical link returns, backlog drains as fast as InfluxDB accepts writes. Disk space for SQLite growth during a long outage is a capacity assumption, see Assumptions. |
 | InfluxDB write API rejects a batch (e.g. malformed point, auth failure, server error) | Rejected rows are not marked sent. | Retried on the next forwarder cycle exactly like a network failure. A rejection that is permanent (e.g. bad credentials) will retry forever and never succeed; this pipeline does not distinguish retryable from permanent failures. Operator visibility into a stuck backlog is not designed here (see Assumptions/Open Questions). |
-| Partial batch failure (some points in a push accepted, some rejected) | Only rows confirmed accepted are marked sent. Any row not confirmed stays `sent = 0` and is retried. | Same retry path as a full failure. A retried row that was actually already accepted produces a harmless duplicate point at the same timestamp in InfluxDB (accepted tradeoff, see idempotency note in Step 3). |
+| Partial batch failure (some points in a push accepted, some rejected) | Only rows confirmed accepted are marked sent. Any row not confirmed stays `sent = 0` and is retried. | Same retry path as a full failure. A retried row that was actually already accepted overwrites the same point (same measurement, tag set, and timestamp) with identical field values in InfluxDB, a no-op, not a duplicate record (accepted tradeoff, see overwrite semantics note in Step 3). |
+| Two distinct sensor readings for the same `site_id` + `sensor_address` + `gas_type` land on the exact same `reading_timestamp_utc` value | Because InfluxDB identifies a point by measurement, tag set, and timestamp together, the second write silently overwrites the first. This is real data loss, not a retry artifact, and InfluxDB returns no error. | Not recoverable after the fact. Prevented structurally, not by luck: the collector must capture `reading_timestamp_utc` at a precision fine enough that two distinct poll cycles for the same channel, 5 to 10 seconds apart, cannot land on the same value. Nanosecond precision (matching InfluxDB's native timestamp resolution) is recommended, millisecond is the practical minimum. This must be an explicit property of the collector's implementation, not an assumption that "5 to 10 seconds apart" is inherently safe. |
 | Clock drift on the Jetson | Reading timestamps are taken from the Jetson's own clock at read time. If that clock is wrong, every point written during the drift window lands at the wrong time in InfluxDB, silently. | Not handled by this pipeline. Flagged as an assumption below, not solved here. |
 
 ## Container Contract
@@ -168,6 +189,20 @@ a single set deliberately: a second command center later means a second set
 of these four values (a second forwarder target), not a redesign of the
 contract. This is not built now, just kept from being awkward later.
 
+The `/api/v2/write` endpoint (InfluxDB OSS v2) requires `org` and `bucket`
+as query parameters, both already covered by `INFLUXDB_ORG`/`INFLUXDB_BUCKET`
+above, plus an `Authorization: Token <token>` header carrying
+`INFLUXDB_TOKEN`. It also accepts an optional `precision` query parameter
+that tells InfluxDB how to interpret the timestamp on each point, defaulting
+to nanoseconds if omitted. This is a real correctness risk worth naming
+explicitly: whatever unit the forwarder actually converts
+`reading_timestamp_utc` to before the HTTP write, seconds, milliseconds, or
+nanoseconds, must match the `precision` parameter sent on that same request.
+A mismatch silently corrupts every timestamp by orders of magnitude with no
+error from InfluxDB. The forwarder should either always convert to
+nanoseconds (matching the default) or always pass an explicit, consistent
+`precision` value, either is acceptable, leaving it implicit is not.
+
 ## Deferred
 
 Security hardening of this pipeline itself, auth on the InfluxDB write
@@ -182,7 +217,7 @@ a dedicated pass before this goes to production.
 |---|---|---|
 | A1 | `SQLITE_DB_PATH` is mounted on storage that survives a Jetson reboot (not container-ephemeral, not tmpfs). | A reboot during a network outage would silently drop the entire unsent backlog, violating the zero data loss requirement. |
 | A2 | The container's restart policy brings the collector and forwarder back up automatically after a Jetson reboot or crash, with no manual intervention. | A reboot could leave both processes down indefinitely with no one aware. |
-| A3 | InfluxDB at the command center is v2-style (org/bucket/token HTTP write API), matching the env vars above. | If it's actually InfluxDB v1 or a different auth model, the forwarder's write calls and the container contract's env vars need to change. |
+| A3 | InfluxDB at the command center runs OSS v2 (self-hosted, TSM engine), using the org/bucket/token HTTP write API described above. This schema and API shape have now been verified as an accurate description of the InfluxDB OSS v2 write API contract specifically, it is not an unverified guess. What remains an assumption is which InfluxDB product or deployment the command center actually runs. | If it's actually InfluxDB v1 or a materially different auth model, the forwarder's write calls and the env vars above need to change. If it's InfluxDB Cloud Serverless, Dedicated, or Clustered instead of OSS v2 (the newer IOx-based products), the write API shape is largely compatible, but the deterministic overwrite behavior this design relies on for retry idempotency (see Step 3) does not hold there, same-timestamp same-tag-set write ordering is not guaranteed deterministic on those products. |
 | A4 | Local disk on the Jetson has enough capacity to hold the full unsent backlog for the longest realistic optical-link outage. | A sufficiently long outage could fill the disk, causing the collector's SQLite writes to start failing, which is a real data loss path this spec does not currently cover. |
 | A5 | The Jetson's system clock is kept reasonably accurate (e.g. NTP, even if only synced during the brief windows the link is up). | Silent timestamp corruption on every reading during a drift window, not caught by any check in this pipeline. |
 
