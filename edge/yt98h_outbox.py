@@ -39,6 +39,23 @@ CREATE TABLE IF NOT EXISTS readings (
 CREATE INDEX IF NOT EXISTS idx_readings_unsent ON readings (sent, id);
 """
 
+# client_api_sent tracks the separate client-API delivery path added in
+# yt98h_client_api.py, independent of `sent` (InfluxDB). It is migrated in
+# rather than added to SCHEMA_SQL above so that an outbox file from before this
+# path existed gains the column in place instead of needing a rebuild.
+# ALTER TABLE has no IF NOT EXISTS form, hence the guard.
+def _ensure_client_api_column(conn):
+    try:
+        conn.execute(
+            "ALTER TABLE readings ADD COLUMN client_api_sent "
+            "INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # already present, from a prior connect() on this file
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_readings_client_api_unsent "
+        "ON readings (client_api_sent, id)")
+
+
 INSERT_SQL = """
 INSERT INTO readings (
     site_id, sensor_address, gas_type, value, raw_register_value,
@@ -68,6 +85,7 @@ def connect(db_path):
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = FULL")
     conn.executescript(SCHEMA_SQL)
+    _ensure_client_api_column(conn)
     conn.commit()
     return conn
 
@@ -120,3 +138,33 @@ def count_unsent(conn):
     number that reveals a backlog growing faster than it drains."""
     return conn.execute(
         "SELECT COUNT(*) FROM readings WHERE sent = 0").fetchone()[0]
+
+
+def fetch_unsent_client_api(conn, limit):
+    """Same as fetch_unsent, for the client-API delivery path.
+
+    A separate column, sent independently: a row already confirmed by
+    InfluxDB can still be unsent here, and vice versa.
+    """
+    return conn.execute(
+        "SELECT * FROM readings WHERE client_api_sent = 0 ORDER BY id LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def mark_client_api_sent(conn, row_ids):
+    """Same as mark_sent, for the client-API delivery path."""
+    ids = list(row_ids)
+    if not ids:
+        return
+    placeholders = ",".join("?" * len(ids))
+    conn.execute(
+        "UPDATE readings SET client_api_sent = 1 WHERE id IN (%s)" % placeholders,
+        ids)
+    conn.commit()
+
+
+def count_unsent_client_api(conn):
+    """Same as count_unsent, for the client-API delivery path."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM readings WHERE client_api_sent = 0").fetchone()[0]

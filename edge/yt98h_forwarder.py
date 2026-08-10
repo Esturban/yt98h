@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-# REUSE_CHECKED: yt98h_outbox.py, yt98h_lineprotocol.py   The queue operations
-# and the point serialization already exist and are tested; this file is only
-# the loop and the HTTP call. urllib is used rather than requests or
-# influxdb-client so this stays stdlib only and adds nothing to the container.
+# REUSE_CHECKED: yt98h_outbox.py, yt98h_lineprotocol.py, yt98h_client_api.py
+# The queue operations and the point serialization already exist and are
+# tested; this file is only the loop and the HTTP calls. urllib is used
+# rather than requests or influxdb-client so this stays stdlib only and adds
+# nothing to the container.
 """
-Forwarder: push unsent outbox rows to the command-center InfluxDB.
+Forwarder: push unsent outbox rows to the command-center InfluxDB, and,
+if configured, also to the client's live production ingest API.
 
     uv run yt98h_forwarder.py
 
@@ -20,6 +22,13 @@ succeeding and the mark landing is harmless: the retry writes the same
 measurement, tag set and timestamp with identical field values, which InfluxDB
 treats as an overwrite of the same point, not a duplicate record.
 
+The client-API path (yt98h_client_api.py) is a second, independent delivery
+target, gated by IR4_DEVICE_TOKEN. It has its own outbox column
+(client_api_sent) and its own drain loop, so a failure or a backlog on either
+target never blocks or is entangled with the other's retry state. See the
+"sent" semantics note in docs/architecture.md for why this is two columns
+rather than one.
+
 Environment (see the Container Contract in docs/architecture.md):
 
     SQLITE_DB_PATH                      required, the outbox file
@@ -29,6 +38,12 @@ Environment (see the Container Contract in docs/architecture.md):
     INFLUXDB_BUCKET                     required
     FORWARDER_RETRY_INTERVAL_SECONDS    optional, defaults to 15
     FORWARDER_BATCH_SIZE                optional, defaults to 500
+    IR4_INGEST_URL                      optional, defaults to the confirmed
+                                         client production endpoint
+    IR4_DEVICE_TOKEN                    optional, no default. Unset means the
+                                         client-API path is disabled entirely
+                                         and behaviour is identical to before
+                                         it existed.
 """
 
 import logging
@@ -39,6 +54,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import yt98h_client_api as client_api
 import yt98h_lineprotocol as lineprotocol
 import yt98h_outbox as outbox
 
@@ -78,6 +94,9 @@ def config_from_env():
                                          DEFAULT_BATCH_SIZE)),
         "interval": float(os.environ.get("FORWARDER_RETRY_INTERVAL_SECONDS",
                                          DEFAULT_RETRY_INTERVAL_SECONDS)),
+        "client_api_token": os.environ.get("IR4_DEVICE_TOKEN") or None,
+        "client_api_url": os.environ.get("IR4_INGEST_URL",
+                                         client_api.DEFAULT_INGEST_URL),
     }
 
 
@@ -148,7 +167,43 @@ def drain(conn, url, org, bucket, token, batch_size):
             return pushed, 0
 
 
-def run(db_path, url, org, bucket, token, batch_size, interval, stop_event):
+def drain_client_api(conn, url, token, batch_size):
+    """Same shape as drain(), but for the client-API delivery path.
+
+    Rows are grouped into one payload per poll cycle (see
+    yt98h_client_api.group_by_cycle) rather than pushed as one flat batch, so a
+    failure only leaves the cycles after the failing one unsent, not the whole
+    fetched batch. Marks client_api_sent, never sent, so this never touches the
+    InfluxDB retry state.
+    """
+    pushed = 0
+
+    while True:
+        rows = outbox.fetch_unsent_client_api(conn, batch_size)
+        if not rows:
+            return pushed, 0
+
+        pushed_this_fetch = 0
+        for cycle_rows in client_api.group_by_cycle(rows):
+            try:
+                client_api.post_readings(
+                    url, token, client_api.build_payload(cycle_rows))
+            except (urllib.error.HTTPError, urllib.error.URLError, OSError,
+                    RuntimeError, ValueError) as exc:
+                LOG.warning("client-api cycle of %d rows failed, left unsent: %s",
+                            len(cycle_rows), exc)
+                return pushed, len(rows) - pushed_this_fetch
+
+            outbox.mark_client_api_sent(conn, [row["id"] for row in cycle_rows])
+            pushed += len(cycle_rows)
+            pushed_this_fetch += len(cycle_rows)
+
+        if len(rows) < batch_size:
+            return pushed, 0
+
+
+def run(db_path, url, org, bucket, token, batch_size, interval, stop_event,
+        client_api_url=None, client_api_token=None):
     """Forward forever, or until stop_event is set.
 
     Opens its own SQLite connection, separate from the collector's.
@@ -156,12 +211,18 @@ def run(db_path, url, org, bucket, token, batch_size, interval, stop_event):
     conn = outbox.connect(db_path)
     LOG.info("started: target=%s org=%s bucket=%s batch=%d interval=%.1fs",
              url, org, bucket, batch_size, interval)
+    if client_api_token:
+        LOG.info("client-api target: %s", client_api_url)
 
     try:
         while not stop_event.is_set():
             try:
                 pushed, failed = drain(conn, url, org, bucket, token, batch_size)
                 backlog = outbox.count_unsent(conn)
+                if client_api_token:
+                    ca_pushed, ca_failed = drain_client_api(
+                        conn, client_api_url, client_api_token, batch_size)
+                    ca_backlog = outbox.count_unsent_client_api(conn)
             except Exception as exc:
                 # The outbox itself failed, e.g. the disk is full. Nothing to do
                 # but say so and try again; the collector will be failing too.
@@ -175,6 +236,11 @@ def run(db_path, url, org, bucket, token, batch_size, interval, stop_event):
             log = LOG.warning if failed else LOG.info
             log("forward cycle: %d pushed, %d failed, %d unsent in backlog",
                 pushed, failed, backlog)
+
+            if client_api_token:
+                ca_log = LOG.warning if ca_failed else LOG.info
+                ca_log("client-api forward cycle: %d pushed, %d failed, "
+                       "%d unsent in backlog", ca_pushed, ca_failed, ca_backlog)
 
             stop_event.wait(interval)
     finally:

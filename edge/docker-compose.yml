@@ -71,6 +71,12 @@ services:
       INFLUXDB_ORG: "${INFLUXDB_ORG}"
       INFLUXDB_BUCKET: "${INFLUXDB_BUCKET}"
 
+      # Client's live production ingest API, a second delivery target.
+      # Optional: leave IR4_DEVICE_TOKEN unset in .env to keep this poll
+      # InfluxDB only.
+      IR4_INGEST_URL: "${IR4_INGEST_URL}"
+      IR4_DEVICE_TOKEN: "${IR4_DEVICE_TOKEN}"
+
       # Independent of POLL_INTERVAL_SECONDS. Three collector cycles per
       # forwarder cycle keeps the write rate to the command center modest while
       # the link is up, without letting the backlog build for any real length of
