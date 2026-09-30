@@ -15,3 +15,4 @@ sweep_log_*.csv
 .pad.toml
 .claude/
 .agents/
+.codegraph/
